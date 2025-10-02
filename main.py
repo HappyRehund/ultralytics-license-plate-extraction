@@ -2,20 +2,45 @@ import base64
 import cv2
 import requests
 import ultralytics
-from openai import OpenAI
-from ultralytics import YOLO
-from ultralytics.utils.plotting import Annotator, colors
-from typing import Optional
 import os
-from dotenv import load_dotenv
 import tempfile
 import uuid
 import math
 import hashlib
+import uvicorn
+
 from datetime import datetime
 from collections import defaultdict
+from openai import OpenAI
+from ultralytics import YOLO
+from ultralytics.utils.plotting import Annotator, colors
+from typing import Optional
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from google.cloud import storage
+from dotenv import load_dotenv
+from google.api_core.client_options import ClientOptions
+
 
 load_dotenv()
+
+app = FastAPI(
+    title="Licence Plate Extraction API",
+    description="API for detection and extraction of plate number from video",
+    version="1.0.0"
+)
+
+if os.getenv("STORAGE_EMULATOR_HOST"):
+    # Saat berjalan dengan emulator, gunakan client_options untuk set endpoint
+    api_endpoint = f'http://{os.getenv("STORAGE_EMULATOR_HOST")}'
+    storage_client = storage.Client(
+        credentials=None,
+        project="brong-monitoring-system", # Ganti dengan project ID Anda jika berbeda
+        client_options=ClientOptions(api_endpoint=api_endpoint)
+    )
+else:
+    # Saat di production, gunakan konfigurasi standar
+    storage_client = storage.Client()
 
 # Cek environment ultralytics
 ultralytics.checks()
@@ -75,26 +100,52 @@ def extract_text(base64_encoded_data: str) -> Optional[str]:
     )
     return response.choices[0].message.content
 
-def download_video(video_url: str, save_path: Optional[str] = None) -> str:
-    """Download video dari URL ke file lokal sementara (auto cleanup di caller)."""
-    # gunakan file sementara jika save_path tidak diberikan
-    if save_path is None:
-        tmp = tempfile.NamedTemporaryFile(prefix="anpr-input-", suffix=".mp4", delete=False)
-        save_path = tmp.name
-        tmp.close()
+def download_video_from_gcs(bucket_name: str, source_blob_name: str) -> str:
+    """Download video dari GCS ke file lokal sementara."""
+    try:
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(source_blob_name)
 
-    with requests.get(video_url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with open(save_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    f.write(chunk)
-    return save_path
+        # Buat file sementara untuk menyimpan video
+        _, local_path = tempfile.mkstemp(suffix=".mp4")
+        
+        print(f"[INFO] Mengunduh gs://{bucket_name}/{source_blob_name} ke {local_path}")
+        blob.download_to_filename(local_path)
+        
+        return local_path
+    except Exception as e:
+        print(f"[ERROR] Gagal mengunduh file dari GCS: {e}")
+        raise
+
+def upload_video_to_gcs(bucket_name: str, source_file_name: str, destination_blob_name: str) -> str:
+    """Upload video dari path local ke GCS"""
+    try:
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob_name)
+        
+        print(f"[INFO] Mengunggah {source_file_name} ke gs://{bucket_name}/{destination_blob_name}")
+        blob.upload_from_filename(source_file_name)
+        
+        # Mengembalikan GCS URI
+        return f"gs://{bucket_name}/{destination_blob_name}"
+    
+    except Exception as e:
+        print(f"[ERROR] Gagal mengunggah file ke GCS: {e}")
+        raise
+
+def cleanup_local_file(path: str):
+    """Menghapus file lokal."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"[INFO] File lokal sementara dihapus: {path}")
+    except Exception as e:
+        print(f"[WARN] Gagal menghapus file sementara {path}: {e}")
 
 def process_video(
     video_path: str, 
-    output_path: str = "anpr-output.avi",
-    ocr_every_n_frames: Optional[int] = None,  # auto if None
+    output_path: str = "anpr-output.mp4",
+    ocr_every_n_frames: Optional[int] = None, 
     max_ocr_calls: int = 10,               
     plates_per_window: int = 1,
     ):
@@ -117,6 +168,7 @@ def process_video(
     
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     fps_eff = fps if fps > 0 else 30
+    
     if ocr_every_n_frames is None:
         if frame_count > 0 and max_ocr_calls > 0:
             ocr_every_n_frames = max(1, math.ceil(frame_count / max_ocr_calls))
@@ -174,6 +226,7 @@ def process_video(
             window_ok = window_ocr_counts[win_id] < plates_per_window
 
             response_text = ""
+            
             if stride_ok and window_ok and (crop_hash not in seen_hashes) and (ocr_calls < max_ocr_calls):
                 base64_im0 = base64.b64encode(img_bytes).decode("utf-8")
                 response_text = (extract_text(base64_im0) or "").strip()
@@ -205,50 +258,70 @@ def process_video(
     unique_plates = sorted(list(set(d["text"] for d in detections if d["text"])))
 
     return {
-        "video_path": output_path,
-        "fps": fps_eff,
-        "width": w,
-        "height": h,
-        "detections": detections,
         "unique_plates": unique_plates,
-        "ocr_calls": ocr_calls,
-        "ocr_stride": ocr_every_n_frames,
-        "window_size": window_size,
-        "plates_per_window": plates_per_window,
     }
-
-def gcp_trigger(video_url: str, output_dir: str = "outputs"):
-    """Ambil video dari URL, proses, lalu hapus file input lokal."""
-    print(f"[INFO] Mulai proses video dari URL: {video_url}")
-    os.makedirs(output_dir, exist_ok=True)
-
-    # buat nama output unik agar tidak overwrite
-    out_name = f"anpr-output-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.mp4"
-    output_path = os.path.join(output_dir, out_name)
-
-    local_path = download_video(video_url)  # simpan sementara
-    try:
-        result = process_video(local_path, output_path, ocr_every_n_frames=None, max_ocr_calls=45, plates_per_window=1)
-        print("[INFO] Selesai memproses video.")
-
-        detected_plates = result.get("unique_plates", [])
-        print(f"[INFO] Plat nomor yang berhasil diekstrak: {detected_plates}")
-
-        return result
     
-    finally:
-        # pastikan input sementara dibersihkan
-        try:
-            if os.path.exists(local_path):
-                os.remove(local_path)
-                print(f"[INFO] Hapus file input sementara: {local_path}")
-        except Exception as e:
-            print(f"[WARN] Gagal menghapus file sementara: {e}")
+class VideoProcessRequest(BaseModel):
+    bucket: str
+    file_path: str
+    
+class VideoProcessResponse(BaseModel):
+    processed_video_url: Optional[str] = None
+    extracted_plates: list[str]
+
+@app.post("/process_video", response_model=VideoProcessResponse)
+def process_video_endpoint(request: VideoProcessRequest, background_tasks: BackgroundTasks):
+    """
+    Endpoint untuk memproses video dari Google Cloud Storage.
+    Menerima nama bucket dan path file, lalu mengembalikan URL video yang
+    telah diproses dan daftar plat nomor yang terdeteksi.
+    """
+    try:
+        local_input_path = download_video_from_gcs(request.bucket, request.file_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal mengunduh video: {e}")
+    
+    _, local_output_path = tempfile.mkstemp(suffix=".mp4")
+    
+    background_tasks.add_task(cleanup_local_file, local_input_path)
+    background_tasks.add_task(cleanup_local_file, local_output_path)
+    
+    try:
+        # 2. Proses video menggunakan model ML
+        result = process_video(
+            video_path=local_input_path,
+            output_path=local_output_path,
+            max_ocr_calls=45 # Sesuaikan parameter
+        )
+        
+        extracted_plates = result.get("unique_plates", [])
+        processed_video_url = None
+
+        # 3. Jika ada plat terdeteksi, upload hasilnya ke GCS
+        if extracted_plates:
+            file_name = os.path.basename(request.file_path)
+            destination_blob_name = f"processed_video/{file_name}"
             
+            processed_video_url = upload_video_to_gcs(
+                request.bucket,
+                local_output_path,
+                destination_blob_name
+            )
+        else:
+            print("[INFO] Tidak ada plat nomor terdeteksi, tidak mengunggah video hasil.")
+
+        # 4. Return hasil
+        return VideoProcessResponse(
+            processed_video_url=processed_video_url,
+            extracted_plates=extracted_plates
+        )
+
+    except Exception as e:
+        # Tangani error selama pemrosesan atau upload
+        print(f"[ERROR] Terjadi kesalahan saat pemrosesan video: {e}")
+        raise HTTPException(status_code=500, detail=f"Gagal memproses video: {e}")
+
 # ==== Contoh pemanggilan (simulate trigger) ====
 if __name__ == "__main__":
-    test_url = os.getenv(
-        "ANPR_VIDEO_URL",
-        "https://github.com/ultralytics/assets/releases/download/v0.0.0/anpr-demo-video.mp4",
-    )
-    gcp_trigger(test_url)
+    port = int(os.getenv("PORT", 8880))
+    uvicorn.run(app, host="0.0.0.0", port=port)
